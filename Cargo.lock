@@ -7684,6 +7684,7 @@ dependencies = [
  "parking_lot",
  "profiling",
  "raw-window-handle",
+ "skrifa 0.37.0",
  "smallvec",
  "swash",
  "unicode-bidi",

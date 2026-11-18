@@ -31,6 +31,7 @@ log.workspace = true
 parking_lot.workspace = true
 profiling.workspace = true
 raw-window-handle.workspace = true
+skrifa.workspace = true
 smallvec.workspace = true
 swash.workspace = true
 unicode-bidi.workspace = true

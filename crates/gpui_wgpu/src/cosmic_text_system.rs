@@ -86,6 +86,12 @@ struct LoadedFont {
     font: Arc<CosmicTextFont>,
     features: CosmicFontFeatures,
     is_known_emoji_font: bool,
+    /// The face has color glyphs (a COLR, CBDT, sbix, or SVG table), so its
+    /// glyphs draw as emoji: in color, and not tinted by the text color.
+    is_color_font: bool,
+    /// The index of the face in its file, when it has COLRv1 glyphs, which
+    /// `color_glyph` draws since swash cannot.
+    colr_v1_face: Option<u32>,
     /// resolved at load time so `layout_line` shares one chain across faces.
     /// `Arc` keeps clone cheap on the per-run hot path.
     user_fallback_chain: Arc<[(FontId, SharedString)]>,
@@ -420,13 +426,13 @@ impl CosmicTextSystemState {
             .db()
             .faces()
             .filter(|face| face.families.iter().any(|family| *name == family.0))
-            .map(|face| (face.id, face.post_script_name.clone()))
+            .map(|face| (face.id, face.post_script_name.clone(), face.index))
             .collect::<SmallVec<[_; 4]>>();
 
         let cosmic_features = cosmic_font_features(features)?;
 
         let mut loaded_font_ids = SmallVec::new();
-        for (database_id, postscript_name) in families {
+        for (database_id, postscript_name, face_index) in families {
             let key = LoadedFontKey {
                 database_id,
                 font: loaded_font_key.clone(),
@@ -466,12 +472,13 @@ impl CosmicTextSystemState {
 
             let font_id = FontId(self.loaded_fonts.len());
             loaded_font_ids.push(font_id);
-            self.loaded_fonts.push(LoadedFont {
+            self.loaded_fonts.push(LoadedFont::new(
                 font,
-                features: cosmic_features.clone(),
-                is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
-                user_fallback_chain: Arc::clone(&user_fallback_chain),
-            });
+                cosmic_features.clone(),
+                &postscript_name,
+                face_index,
+                Arc::clone(&user_fallback_chain),
+            ));
             self.loaded_font_ids_by_key.insert(key, font_id);
         }
 
@@ -555,6 +562,22 @@ impl CosmicTextSystemState {
             params.subpixel_variant.y as f32 / SUBPIXEL_VARIANTS_Y as f32 / params.scale_factor,
         );
 
+        if params.is_emoji
+            && let Some(face_index) = loaded_font.colr_v1_face
+            && let Some(image) = crate::color_glyph::render(
+                loaded_font.font.data(),
+                face_index,
+                params.glyph_id.0,
+                pixel_size * params.scale_factor,
+                (
+                    subpixel_offset.x * params.scale_factor,
+                    subpixel_offset.y * params.scale_factor,
+                ),
+            )
+        {
+            return Ok(image);
+        }
+
         let mut scaler = self
             .swash_scale_context
             .builder(font_ref)
@@ -615,12 +638,14 @@ impl CosmicTextSystemState {
                 .context("fallback font face not found in cosmic-text database")?;
 
             let font_id = FontId(self.loaded_fonts.len());
-            self.loaded_fonts.push(LoadedFont {
+            let loaded_font = LoadedFont::new(
                 font,
-                features: CosmicFontFeatures::new(),
-                is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
-                user_fallback_chain: Arc::from(Vec::new()),
-            });
+                CosmicFontFeatures::new(),
+                &face.post_script_name,
+                face.index,
+                Arc::from(Vec::new()),
+            );
+            self.loaded_fonts.push(loaded_font);
 
             Ok(font_id)
         }
@@ -839,10 +864,10 @@ impl CosmicTextSystemState {
                     }
                 }
             }
-            let is_emoji = loaded_font.is_known_emoji_font;
+            let is_emoji = loaded_font.is_known_emoji_font || loaded_font.is_color_font;
 
             // HACK: Prevent crash caused by variation selectors.
-            if glyph.glyph_id == 3 && is_emoji {
+            if glyph.glyph_id == 3 && loaded_font.is_known_emoji_font {
                 continue;
             }
 
@@ -1231,6 +1256,32 @@ fn face_info_into_properties(
             cosmic_text::Stretch::UltraCondensed => font_kit::properties::Stretch::ULTRA_CONDENSED,
             cosmic_text::Stretch::UltraExpanded => font_kit::properties::Stretch::ULTRA_EXPANDED,
         },
+    }
+}
+
+impl LoadedFont {
+    fn new(
+        font: Arc<CosmicTextFont>,
+        features: CosmicFontFeatures,
+        postscript_name: &str,
+        face_index: u32,
+        user_fallback_chain: Arc<[(FontId, SharedString)]>,
+    ) -> Self {
+        let swash_font = font.as_swash();
+        let colr = swash_font.table(swash::tag_from_bytes(b"COLR"));
+        let is_color_font = colr.is_some()
+            || [b"CBDT", b"sbix", b"SVG "]
+                .iter()
+                .any(|tag| swash_font.table(swash::tag_from_bytes(tag)).is_some());
+        let colr_v1_face = crate::color_glyph::has_colr_v1(colr).then_some(face_index);
+        Self {
+            is_known_emoji_font: check_is_known_emoji_font(postscript_name),
+            is_color_font,
+            colr_v1_face,
+            font,
+            features,
+            user_fallback_chain,
+        }
     }
 }
 
@@ -1994,6 +2045,53 @@ mod tests {
                 .font_id(&gpui::font("GPUI Test Arabic"))
                 .is_err()
         );
+        Ok(())
+    }
+
+    const COLOR_EMOJI: &[u8] = include_bytes!("../test_fonts/GpuiTestColorEmoji.ttf");
+
+    #[test]
+    fn a_colrv1_glyph_draws_in_its_palette_colors() -> Result<()> {
+        let text_system = text_system()?;
+        text_system.add_fonts(vec![Cow::Borrowed(COLOR_EMOJI)])?;
+        let text = "\u{1F44D}";
+        let font_id = text_system.font_id(&plex_then(&["GPUI Test Color Emoji"]))?;
+        let layout = text_system.layout_line(
+            text,
+            gpui::px(32.),
+            &[FontRun {
+                len: text.len(),
+                font_id,
+            }],
+        );
+        let run = &layout.runs[0];
+        let glyph = &run.glyphs[0];
+        // The face is known as a color face by its COLR table, not its name.
+        assert!(glyph.is_emoji);
+        let params = RenderGlyphParams {
+            font_id: run.font_id,
+            glyph_id: glyph.id,
+            font_size: gpui::px(32.),
+            subpixel_variant: gpui::Point::default(),
+            scale_factor: 2.,
+            is_emoji: true,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+        let bounds = text_system.glyph_raster_bounds(&params)?;
+        assert!(
+            bounds.size.width.0 > 32 && bounds.size.height.0 > 32,
+            "{bounds:?}"
+        );
+        let (_, bgra) = text_system.rasterize_glyph(&params, bounds)?;
+        // The thumb of Noto Color Emoji is yellow, from a gradient.
+        let yellow = bgra
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|&&[b, g, r, a]| a > 200 && r > 200 && g > 140 && b < 90)
+            .count();
+        assert!(yellow > 200, "{yellow} yellow pixels");
         Ok(())
     }
 }
